@@ -7,8 +7,7 @@ Static frontend starter for a Monogatari story/capture site.
 This template deploys with GitHub Pages Actions. The default build is a pure frontend story site:
 
 - `VITE_STATIC_STORY=true`
-- GitHub login button visible
-- Google, email, and registration entry points hidden
+- login entry points hidden
 - capture comments configured through Giscus variables
 
 Set these repository variables when you want capture comments:
