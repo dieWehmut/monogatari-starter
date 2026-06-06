@@ -1,0 +1,80 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10 --activate
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        env:
+          VITE_API_BASE: ''
+          VITE_STATIC_STORY: 'true'
+          VITE_AUTH_ENABLE_GITHUB: 'true'
+          VITE_AUTH_ENABLE_GOOGLE: 'false'
+          VITE_AUTH_ENABLE_EMAIL: 'false'
+          VITE_AUTH_ENABLE_REGISTER: 'false'
+          VITE_CAPTURE_GISCUS_REPO: ${{ vars.VITE_CAPTURE_GISCUS_REPO || github.repository }}
+          VITE_CAPTURE_GISCUS_REPO_ID: ${{ vars.VITE_CAPTURE_GISCUS_REPO_ID }}
+          VITE_CAPTURE_GISCUS_CATEGORY: ${{ vars.VITE_CAPTURE_GISCUS_CATEGORY || 'General' }}
+          VITE_CAPTURE_GISCUS_CATEGORY_ID: ${{ vars.VITE_CAPTURE_GISCUS_CATEGORY_ID }}
+          VITE_CAPTURE_GISCUS_MAPPING: ${{ vars.VITE_CAPTURE_GISCUS_MAPPING || 'specific' }}
+          VITE_CAPTURE_GISCUS_STRICT: ${{ vars.VITE_CAPTURE_GISCUS_STRICT || '0' }}
+          VITE_CAPTURE_GISCUS_REACTIONS_ENABLED: ${{ vars.VITE_CAPTURE_GISCUS_REACTIONS_ENABLED || '1' }}
+          VITE_CAPTURE_GISCUS_INPUT_POSITION: ${{ vars.VITE_CAPTURE_GISCUS_INPUT_POSITION || 'bottom' }}
+          VITE_CAPTURE_GISCUS_THEME: ${{ vars.VITE_CAPTURE_GISCUS_THEME || 'nexus' }}
+          VITE_CAPTURE_GISCUS_LANG: ${{ vars.VITE_CAPTURE_GISCUS_LANG || 'zh-CN' }}
+        run: |
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          if [ "$repo_name" = "${GITHUB_REPOSITORY_OWNER}.github.io" ]; then
+            export VITE_BASE_PATH="/"
+          else
+            export VITE_BASE_PATH="/${repo_name}/"
+          fi
+          echo "VITE_BASE_PATH=$VITE_BASE_PATH"
+          pnpm build
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

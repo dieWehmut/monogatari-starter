@@ -1,0 +1,631 @@
+import type {
+  AuthSession,
+  CommentItem,
+  CreateImagePayload,
+  FeedUser,
+  HealthStats,
+  Identity,
+  ImageItem,
+  LikeToggleResult,
+  UpdateImagePayload,
+} from '../types/image';
+import { translate } from '../hooks/useTranslation';
+import { mediaTypeFromFile, normalizeAssetTypes } from './media';
+
+const normalizeApiBase = (value: string) => value.trim().replace(/\/$/, '');
+
+export const API_BASE_FALLBACK = 'https://REDACTED.hf.space';
+
+export const API_BASE = normalizeApiBase(import.meta.env.VITE_API_BASE ?? '');
+const usesHostedFallbackBase = (value: string) => value.includes('.hf.space');
+
+// log the computed base so we can spot misconfiguration in client consoles
+if (typeof window !== 'undefined') {
+  // eslint-disable-next-line no-console
+}
+
+const withApiBase = (value: string) => {
+  if (!value || value.startsWith('http://') || value.startsWith('https://')) {
+    return value;
+  }
+
+  return `${API_BASE}${value}`;
+};
+
+const normalizeSession = (session: AuthSession): AuthSession => ({
+  ...session,
+  loginUrl: withApiBase(session.loginUrl),
+  googleLoginUrl: session.googleLoginUrl ? withApiBase(session.googleLoginUrl) : undefined,
+  emailLoginUrl: session.emailLoginUrl ? withApiBase(session.emailLoginUrl) : undefined,
+});
+
+type RawIdentity = Identity & {
+  user_login?: string;
+  provider_id?: string;
+  display_name?: string;
+  created_at?: string;
+  userLogin?: string;
+  providerId?: string;
+  displayName?: string;
+  createdAt?: string;
+};
+
+const normalizeIdentity = (identity: RawIdentity): Identity => ({
+  id: identity.id,
+  userLogin: identity.userLogin ?? identity.user_login ?? '',
+  provider: identity.provider,
+  providerId: identity.providerId ?? identity.provider_id ?? '',
+  email: identity.email ?? '',
+  displayName: identity.displayName ?? identity.display_name ?? '',
+  createdAt: identity.createdAt ?? identity.created_at ?? '',
+});
+
+const normalizeImageItem = (item: ImageItem): ImageItem => {
+  const imageUrls = (item.imageUrls ?? []).map(withApiBase);
+  return {
+    ...item,
+    tags: item.tags ?? [],
+    timeMode: item.timeMode ?? 'point',
+    startAt: item.startAt ?? item.capturedAt ?? item.createdAt,
+    endAt: item.timeMode === 'range' ? item.endAt : undefined,
+    capturedAt: item.capturedAt ?? item.startAt ?? item.createdAt,
+    imageUrls,
+    assetTypes: normalizeAssetTypes(imageUrls, item.assetTypes),
+  };
+};
+
+const normalizeCommentItem = (item: CommentItem): CommentItem => {
+  const imageUrls = (item.imageUrls ?? (item.imageUrl ? [item.imageUrl] : [])).map(withApiBase);
+  return {
+    ...item,
+    imageUrl: imageUrls[0],
+    imageUrls,
+    assetTypes: normalizeAssetTypes(imageUrls, item.assetTypes),
+    likeCount: item.likeCount ?? 0,
+    liked: !!item.liked,
+  };
+};
+
+const nextAssetIndex = (paths: string[]) => {
+  let max = -1;
+  paths.forEach((path) => {
+    const trimmed = path.trim();
+    if (!trimmed) return;
+    const last = trimmed.split('/').pop() ?? '';
+    const parsed = Number.parseInt(last, 10);
+    if (!Number.isNaN(parsed)) {
+      max = Math.max(max, parsed);
+    }
+  });
+  return max + 1;
+};
+
+const extractErrorMessage = async (response: Response) => {
+  const contentType = response.headers.get('content-type') || '';
+
+  if (contentType.includes('application/json')) {
+    const payload = (await response.json()) as { error?: string; message?: string };
+    return payload.error || payload.message || 'Request failed';
+  }
+
+  const text = await response.text();
+  if (text.includes('<!DOCTYPE html') || text.includes('<html')) {
+    return translate('messages.loadFailed');
+  }
+
+  return text || 'Request failed';
+};
+
+const request = async <T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> => {
+  const doFetch = async (url: string | URL) => {
+    const response = await fetch(url, {
+      credentials: 'include',
+      ...init,
+    });
+
+    if (!response.ok) {
+      throw new Error(await extractErrorMessage(response));
+    }
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      throw new Error(await extractErrorMessage(response));
+    }
+
+    return (await response.json()) as T;
+  };
+
+  try {
+    return await doFetch(input as any);
+  } catch (err: any) {
+    // If a direct backend URL returns HTML, retry through the same-origin proxy.
+    if (
+      API_BASE &&
+      usesHostedFallbackBase(API_BASE) &&
+      typeof input === 'string' &&
+      input.startsWith(API_BASE) &&
+      err instanceof Error &&
+      typeof err.message === 'string' &&
+      err.message.includes('HTML 页面')
+    ) {
+      const alt = input.replace(API_BASE, '');
+      console.warn('API request failed against configured backend, retrying via proxy', input, '->', alt);
+      return await doFetch(alt);
+    }
+
+    // When same-origin proxying is already in use, only try the fallback base
+    // after an explicit backend URL has failed.
+    if (
+      API_BASE &&
+      typeof input === 'string' &&
+      (input.startsWith('/') || input.startsWith(API_BASE)) &&
+      (err instanceof Error && (err.message.includes('redirect') || err.message.includes('Too many redirects') || err instanceof TypeError))
+    ) {
+      const alt = input.startsWith('/') ? API_BASE_FALLBACK + input : input.replace(API_BASE, API_BASE_FALLBACK);
+      try {
+        console.warn('API request failed via configured backend, retrying via fallback base', input, '->', alt);
+        return await doFetch(alt);
+      } catch (innerErr) {
+        // continue to throw original error below if direct retry also fails
+      }
+    }
+    throw err;
+  }
+};
+
+const fileToWebp = async (file: File): Promise<Blob> => {
+  const imageUrl = URL.createObjectURL(file);
+
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const nextImage = new Image();
+
+      nextImage.onload = () => resolve(nextImage);
+      nextImage.onerror = () => reject(new Error('Failed to read image file'));
+      nextImage.src = imageUrl;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Canvas context unavailable');
+    }
+
+    context.drawImage(image, 0, 0);
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob(resolve, 'image/webp', 0.92);
+    });
+
+    if (!blob) {
+      throw new Error('WebP conversion failed');
+    }
+
+    return blob;
+  } finally {
+    URL.revokeObjectURL(imageUrl);
+  }
+};
+
+type SignedUpload = {
+  publicId: string;
+  uploadUrl: string;
+  apiKey: string;
+  timestamp: string;
+  signature: string;
+  resourceType: 'image' | 'video';
+  invalidate: string;
+  overwrite: string;
+};
+
+type UploadPlan = {
+  imageId?: string;
+  commentId?: string;
+  uploads: SignedUpload[];
+};
+
+type UploadItem = {
+  file: File;
+  mediaType: 'image' | 'video';
+};
+
+const toWebpFile = async (file: File): Promise<File> => {
+  const webpBlob = await fileToWebp(file);
+  const baseName = file.name.replace(/\.[^.]+$/, '') || 'image';
+  return new File([webpBlob], `${baseName}.webp`, { type: 'image/webp' });
+};
+
+const prepareUploadItems = async (files: File[]): Promise<UploadItem[]> => {
+  const items: UploadItem[] = [];
+  for (const file of files) {
+    const mediaType = mediaTypeFromFile(file);
+    if (mediaType === 'video') {
+      items.push({ file, mediaType: 'video' });
+      continue;
+    }
+    const webpFile = await toWebpFile(file);
+    items.push({ file: webpFile, mediaType: 'image' });
+  }
+  return items;
+};
+
+const uploadToCloudinary = async (signed: SignedUpload, file: File) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('api_key', signed.apiKey);
+  formData.append('timestamp', signed.timestamp);
+  formData.append('signature', signed.signature);
+  formData.append('public_id', signed.publicId);
+  formData.append('invalidate', signed.invalidate || 'true');
+  formData.append('overwrite', signed.overwrite || 'true');
+
+  const response = await fetch(signed.uploadUrl, {
+    method: 'POST',
+    body: formData,
+  });
+
+  if (!response.ok) {
+    let message = 'Cloudinary upload failed';
+    try {
+      const payload = (await response.json()) as { error?: { message?: string } };
+      if (payload?.error?.message) {
+        message = payload.error.message;
+      }
+    } catch {
+      try {
+        const text = await response.text();
+        if (text) {
+          message = text;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    throw new Error(message);
+  }
+};
+
+const UPLOAD_BATCH_SIZE = 10;
+
+const uploadImageBatches = async (items: UploadItem[], options?: { imageId?: string; startIndex?: number }) => {
+  let imageId = options?.imageId ?? '';
+  let startIndex = options?.startIndex ?? 0;
+  const assetPaths: string[] = [];
+
+  for (let offset = 0; offset < items.length; offset += UPLOAD_BATCH_SIZE) {
+    const batch = items.slice(offset, offset + UPLOAD_BATCH_SIZE);
+    const plan = await request<UploadPlan>(`${API_BASE}/api/uploads/images`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        imageId: imageId || undefined,
+        startIndex,
+        items: batch.map((item) => ({ mediaType: item.mediaType })),
+      }),
+    });
+
+    if (!plan.uploads || plan.uploads.length !== batch.length) {
+      throw new Error('Upload plan mismatch');
+    }
+
+    if (!imageId && plan.imageId) {
+      imageId = plan.imageId;
+    }
+
+    await Promise.all(plan.uploads.map((upload, index) => uploadToCloudinary(upload, batch[index].file)));
+
+    assetPaths.push(...plan.uploads.map((upload) => upload.publicId));
+    startIndex += batch.length;
+  }
+
+  return { imageId, assetPaths };
+};
+
+type CommentPayloadOptions = {
+  parentId?: string | null;
+  replyToUserLogin?: string | null;
+};
+
+export const api = {
+  getSession: async () => normalizeSession(await request<AuthSession>(`${API_BASE}/api/auth/session`)),
+  requestEmailLogin: (email: string, endpoint?: string, options?: { returnTo?: string; client?: 'web' | 'app' }) =>
+    request<{ ok: boolean; loginId?: string }>(endpoint ?? `${API_BASE}/api/auth/email/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email,
+        returnTo: options?.returnTo,
+        client: options?.client,
+      }),
+    }),
+  exchangeSession: (token: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/auth/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }),
+  exchangeEmailLogin: (token: string, endpoint?: string) =>
+    request<{ ok: boolean }>(endpoint ?? `${API_BASE}/api/auth/email/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }),
+  verifyEmailLogin: (token: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/auth/email/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }),
+  confirmEmailLogin: (token: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/auth/email/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }),
+  pollEmailLogin: (loginId: string) =>
+    request<{ ok: boolean; authenticated: boolean }>(`${API_BASE}/api/auth/email/poll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ loginId }),
+    }),
+  pollAppOAuth: (nonce: string) =>
+    request<{ ok: boolean; authenticated: boolean }>(`${API_BASE}/api/auth/app/poll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ nonce }),
+    }),
+  updateProfile: (payload: { displayName?: string; avatarUrl?: string }) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/auth/profile`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  logout: () => request<{ ok: boolean }>(`${API_BASE}/api/auth/logout`, { method: 'POST' }),
+  register: (payload: { username: string; email: string; purpose: string; inviteCode: string; registerMethod: string }) =>
+    request<{ ok: boolean; message?: string; error?: string }>(`${API_BASE}/api/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  getFeed: async () => (await request<ImageItem[]>(`${API_BASE}/api/feed`)).map(normalizeImageItem),
+  getFeedUsers: () => request<FeedUser[]>(`${API_BASE}/api/feed/users`),
+  getFollowing: () => request<FeedUser[]>(`${API_BASE}/api/following`),
+  getFollowers: () => request<FeedUser[]>(`${API_BASE}/api/followers`),
+  followUser: (login: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/follow/${encodeURIComponent(login)}`, { method: 'POST' }),
+  unfollowUser: (login: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/follow/${encodeURIComponent(login)}`, { method: 'DELETE' }),
+  createImage: async (payload: CreateImagePayload) => {
+    // Use a trailing slash for hosted fallback and same-origin proxy paths to avoid redirect loops.
+    const imagesEndpoint =
+      API_BASE === '' || usesHostedFallbackBase(API_BASE)
+        ? `${API_BASE}/api/images/`
+        : `${API_BASE}/api/images`;
+
+    const basePayload = {
+      description: payload.description,
+      tags: payload.tags,
+      timeMode: payload.timeMode,
+      startAt: payload.startAt,
+      endAt: payload.endAt,
+    };
+
+    if (!payload.files || payload.files.length === 0) {
+      return normalizeImageItem(
+        await request<ImageItem>(imagesEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(basePayload),
+        })
+      );
+    }
+
+    const items = await prepareUploadItems(payload.files);
+    const batchResult = await uploadImageBatches(items);
+    if (!batchResult.imageId) {
+      throw new Error('Upload plan mismatch');
+    }
+    const assetPaths = batchResult.assetPaths;
+    return normalizeImageItem(
+      await request<ImageItem>(imagesEndpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...basePayload,
+          id: batchResult.imageId,
+          assetPaths,
+        }),
+      })
+    );
+  },
+  updateImage: async (payload: UpdateImagePayload) => {
+    const basePayload = {
+      description: payload.description,
+      tags: payload.tags,
+      timeMode: payload.timeMode,
+      startAt: payload.startAt,
+      endAt: payload.endAt,
+    };
+
+    const buildAssetPaths = (newPaths: string[]) => {
+      if (!payload.assetOrder || !payload.assetPathMap) {
+        return newPaths;
+      }
+      const ordered: string[] = [];
+      payload.assetOrder.forEach((item) => {
+        if (item.kind === 'url') {
+          const existingPath = payload.assetPathMap?.[item.url];
+          if (existingPath) ordered.push(existingPath);
+          return;
+        }
+        const nextPath = newPaths[item.index];
+        if (nextPath) ordered.push(nextPath);
+      });
+      return ordered;
+    };
+
+    if (!payload.files || payload.files.length === 0) {
+      if (payload.assetOrder && payload.assetPathMap) {
+        const assetPaths = buildAssetPaths([]);
+        return normalizeImageItem(
+          await request<ImageItem>(`${API_BASE}/api/my/images/${payload.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...basePayload,
+              assetPaths,
+            }),
+          })
+        );
+      }
+
+      return normalizeImageItem(
+        await request<ImageItem>(`${API_BASE}/api/my/images/${payload.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(basePayload),
+        })
+      );
+    }
+
+    const items = await prepareUploadItems(payload.files);
+    const existingPaths = payload.assetPathMap ? Object.values(payload.assetPathMap) : [];
+    const startIndex = nextAssetIndex(existingPaths);
+    const batchResult = await uploadImageBatches(items, { imageId: payload.id, startIndex });
+    const assetPaths = buildAssetPaths(batchResult.assetPaths);
+    return normalizeImageItem(
+      await request<ImageItem>(`${API_BASE}/api/my/images/${payload.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...basePayload,
+          assetPaths,
+        }),
+      })
+    );
+  },
+  deleteImage: (id: string) => request<{ ok: boolean }>(`${API_BASE}/api/my/images/${id}`, { method: 'DELETE' }),
+  toggleLike: (ownerLogin: string, postID: string) =>
+    request<LikeToggleResult>(`${API_BASE}/api/images/${ownerLogin}/${postID}/like`, { method: 'POST' }),
+  toggleCommentLike: (ownerLogin: string, postID: string, commentID: string) =>
+    request<LikeToggleResult>(`${API_BASE}/api/images/${ownerLogin}/${postID}/comments/${commentID}/like`, { method: 'POST' }),
+  getComments: async (ownerLogin: string, postID: string) => {
+    const items = await request<CommentItem[]>(`${API_BASE}/api/images/${ownerLogin}/${postID}/comments`);
+    return items.map(normalizeCommentItem);
+  },
+  addComment: async (ownerLogin: string, postID: string, text: string, files?: File[], options?: CommentPayloadOptions) => {
+    if (files && files.length > 0) {
+      const items = await prepareUploadItems(files);
+      const plan = await request<UploadPlan>(`${API_BASE}/api/uploads/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          postOwner: ownerLogin,
+          postId: postID,
+          items: items.map((item) => ({ mediaType: item.mediaType })),
+        }),
+      });
+
+      if (!plan.uploads || plan.uploads.length !== items.length) {
+        throw new Error('Upload plan mismatch');
+      }
+
+      await Promise.all(plan.uploads.map((upload, index) => uploadToCloudinary(upload, items[index].file)));
+
+      const payload: Record<string, any> = {
+        text,
+        commentId: plan.commentId,
+        assetPaths: plan.uploads.map((upload) => upload.publicId),
+      };
+      if (options?.parentId) payload.parentId = options.parentId;
+      if (options?.replyToUserLogin) payload.replyToUserLogin = options.replyToUserLogin;
+
+      const item = await request<CommentItem>(`${API_BASE}/api/images/${ownerLogin}/${postID}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      return normalizeCommentItem(item);
+    }
+    const item = await request<CommentItem>(`${API_BASE}/api/images/${ownerLogin}/${postID}/comments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text,
+        parentId: options?.parentId ?? '',
+        replyToUserLogin: options?.replyToUserLogin ?? '',
+      }),
+    });
+    return normalizeCommentItem(item);
+  },
+  deleteComment: (ownerLogin: string, postID: string, commentID: string, commenterLogin?: string) => {
+    const params = commenterLogin ? `?commenter=${encodeURIComponent(commenterLogin)}` : '';
+    return request<{ ok: boolean }>(`${API_BASE}/api/images/${ownerLogin}/${postID}/comments/${commentID}${params}`, { method: 'DELETE' });
+  },
+  getStats: () => request<HealthStats>(`${API_BASE}/api/health/stats`),
+  pingStats: () => request<{ ok: boolean }>(`${API_BASE}/api/health/ping`, { method: 'POST' }),
+  getNotification: () => request<{ enabled: boolean; title: string; content: string }>(`${API_BASE}/api/notification`),
+  updateNotification: (payload: { enabled: boolean; title: string; content: string }) =>
+    request<{ enabled: boolean; title: string; content: string }>(`${API_BASE}/api/notification`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  getInviteCode: () =>
+    request<{ ok: boolean; code: string; expiresAt?: string }>(`${API_BASE}/api/admin/invite-code`),
+  generateInviteCode: (ttlSeconds?: number) =>
+    request<{ ok: boolean; code: string; expiresAt?: string }>(`${API_BASE}/api/admin/invite-code`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttlSeconds: ttlSeconds ?? 0 }),
+    }),
+  deleteInviteCode: () =>
+    request<{ ok: boolean }>(`${API_BASE}/api/admin/invite-code`, { method: 'DELETE' }),
+  getAdminEmail: () =>
+    request<{ ok: boolean; email: string }>(`${API_BASE}/api/admin/email`),
+  setAdminEmail: (email: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/admin/email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    }),
+  getUserEmail: () =>
+    request<{ ok: boolean; email: string }>(`${API_BASE}/api/auth/email-binding`),
+  setUserEmail: (email: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/auth/email-binding`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    }),
+  // Account binding APIs
+  getIdentities: () =>
+    request<{ ok: boolean; identities: RawIdentity[] }>(`${API_BASE}/api/auth/identities`).then((res) => ({
+      ...res,
+      identities: (res.identities ?? []).map(normalizeIdentity),
+    })),
+  startBindGitHub: () =>
+    request<{ ok: boolean; url: string }>(`${API_BASE}/api/auth/bind/github`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }),
+  startBindGoogle: () =>
+    request<{ ok: boolean; url: string }>(`${API_BASE}/api/auth/bind/google`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }),
+  bindEmail: (email: string) =>
+    request<{ ok: boolean; message: string }>(`${API_BASE}/api/auth/bind/email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    }),
+  unbindProvider: (provider: string) =>
+    request<{ ok: boolean }>(`${API_BASE}/api/auth/unbind/${provider}`, {
+      method: 'DELETE',
+    }),
+};
